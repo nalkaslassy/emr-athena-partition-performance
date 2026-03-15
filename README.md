@@ -84,6 +84,35 @@ TBLPROPERTIES ('parquet.compress'='SNAPPY');
 MSCK REPAIR TABLE transactions;
 ```
 
+## Partition Strategy
+
+The dataset is partitioned by `dt` (a date string derived from the transaction timestamp). This was a deliberate design choice:
+
+- **Why `dt` and not `transactionid`?** Partition keys need low cardinality — a manageable number of distinct values. `transactionid` is unique per row (10M values), which would create 10M partitions and destroy performance. `dt` gives 92 partitions for 3 months of data.
+- **Why daily and not monthly?** Daily partitions give Athena finer control over what to skip. A query for a single day skips 91/92 partitions. With monthly partitions, that same query would have to scan the entire month.
+- **How it works physically:** PySpark writes each day's data into a separate S3 folder named `dt=YYYY-MM-DD/`. When Athena sees a `WHERE dt = '...'` filter, it only opens the matching folder and ignores the rest entirely — it never reads those files at all.
+
+## IAM Setup
+
+Two IAM roles are required:
+
+- **EMR service role** (`EMR_DefaultRole`) — used by the EMR control plane to provision EC2 instances and manage the cluster
+- **EC2 instance profile** — attached to every node in the cluster, controls what the nodes themselves can do
+
+The instance profile needs **S3 write access**, not just read. This matters for two reasons: the PySpark job writes the curated Parquet output to S3, and the EMR log aggregation daemon writes step logs to S3. Without write access, both the job output and all logs silently fail.
+
+**Athena permissions** — Athena queries were run as the `mladmin` IAM user which had broad S3 access. In a production setup, the querying identity would need two specific permissions:
+- `s3:GetObject` on the curated data path (`s3://your-bucket/curated/transactions/*`)
+- `s3:PutObject` on the Athena results path (`s3://your-bucket/athena-results/*`) — Athena writes every query result to S3 before returning it, so write access on the output location is required
+
+## Issues Encountered
+
+**No logs after step failure** — The EC2 instance profile had `AmazonS3ReadOnlyAccess`. The nodes could read data but couldn't write logs to S3, so every failed step produced zero output. Fixed by attaching `AmazonS3FullAccess` to the instance profile role.
+
+**Spark deploy mode** — The EMR console defaults to "Cluster mode" for Spark steps, which runs the driver on a worker node. Python scripts submitted from S3 don't work in cluster mode — YARN can't properly localize and execute them. The fix is to select "Client mode", which runs the driver on the master node where the S3 path is handled correctly.
+
+**Glue schema type mismatch** — After running `MSCK REPAIR TABLE`, Athena returned a type error on the `amount` column. The Glue crawler had registered partition-level schemas with `amount` as `string`, conflicting with the `DOUBLE` type in the Parquet files. Fixed by dropping the table and recreating it with an explicit DDL statement rather than relying on the crawler.
+
 ## Tech Stack
 - **AWS EMR** — managed Spark cluster for distributed transformation
 - **Apache Spark / PySpark** — distributed data processing
